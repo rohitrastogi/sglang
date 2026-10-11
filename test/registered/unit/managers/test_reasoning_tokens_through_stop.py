@@ -11,7 +11,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_MATCHED_STR, Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -111,13 +111,22 @@ class TestReasoningTokensThroughStop(CustomTestCase):
 
     def test_speculative_cutoffs(self):
         for overlap in (False, True):
-            for cutoff in ("length", "eos", "stop_token", "stop_string", "none"):
+            for cutoff in (
+                "length",
+                "eos",
+                "stop_token",
+                "stop_string",
+                "stop_regex",
+                "none",
+            ):
                 with self.subTest(overlap=overlap, cutoff=cutoff):
                     kwargs = {}
                     if cutoff == "stop_token":
                         kwargs["stop_token_ids"] = {STOP}
                     elif cutoff == "stop_string":
                         kwargs["stop"] = ["STOP"]
+                    elif cutoff == "stop_regex":
+                        kwargs["stop_regex"] = ["ST[O]P"]
                     req = _make_req(
                         max_new_tokens=24 if cutoff == "length" else 1000, **kwargs
                     )
@@ -133,6 +142,62 @@ class TestReasoningTokensThroughStop(CustomTestCase):
                     self.assertEqual(req.reasoning_tokens, retained)
                     self.assertEqual(req.finished(), cutoff != "none")
                     self.assertFalse(req._is_reasoning_over)
+
+    def test_overlap_tick_after_finish_does_not_change_request(self):
+        req = _make_req(max_new_tokens=2)
+        processor = _make_processor(overlap=True)
+        _decode(processor, req, [10, 7, 11])
+        self.assertTrue(req.finished())
+        self.assertEqual(req.reasoning_tokens, 2)
+        self.assertEqual(req._think_end_match_len, 1)
+        output_ids = list(req.output_ids)
+        finish_reason = req.finished_reason
+        matcher = req._think_end_matcher
+
+        # This would complete the partial marker if the overshoot tick were
+        # incorrectly committed or consumed by reasoning accounting.
+        _decode(processor, req, [8, 12])
+
+        self.assertEqual(list(req.output_ids), output_ids)
+        self.assertEqual(list(req.output_ids_through_stop), [10, 7])
+        self.assertIs(req.finished_reason, finish_reason)
+        self.assertEqual(req.finished_len, 2)
+        self.assertEqual(req.reasoning_tokens, 2)
+        self.assertIs(req._think_end_matcher, matcher)
+        self.assertEqual(req._think_end_match_len, 1)
+        self.assertFalse(req._is_reasoning_over)
+
+    def test_invalid_token_correction_cuts_off_reasoning(self):
+        for invalid_token in (-1, 100):
+            with self.subTest(invalid_token=invalid_token):
+                req = _make_req()
+                _decode(_make_processor(), req, [11, invalid_token, 7, 8])
+
+                self.assertEqual(list(req.output_ids), [11, EOS, 7, 8])
+                self.assertEqual(list(req.output_ids_through_stop), [11, EOS])
+                self.assertIsInstance(req.finished_reason, FINISH_MATCHED_STR)
+                self.assertEqual(req.finished_reason.matched, "NaN happened")
+                self.assertEqual(req.reasoning_tokens, 2)
+                self.assertEqual(req._think_end_match_len, 0)
+                self.assertFalse(req._is_reasoning_over)
+
+    def test_external_abort_keeps_accepted_tokens(self):
+        for tokens, reasoning, over in (([11, 12], 4, False), ([8, 11], 3, True)):
+            with self.subTest(tokens=tokens):
+                req = _make_req()
+                processor = _make_processor()
+                _decode(processor, req, [10, 7])
+                abort = FINISH_ABORT("external abort")
+                req.to_finish = abort
+
+                _decode(processor, req, tokens)
+
+                self.assertIs(req.finished_reason, abort)
+                self.assertIsNone(req.to_finish)
+                self.assertIsNone(req.finished_len)
+                self.assertEqual(list(req.output_ids_through_stop), [10, 7] + tokens)
+                self.assertEqual(req.reasoning_tokens, reasoning)
+                self.assertEqual(req._is_reasoning_over, over)
 
     def test_think_end_around_cutoff(self):
         cases = [
