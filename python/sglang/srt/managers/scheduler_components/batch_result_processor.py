@@ -1033,11 +1033,12 @@ class SchedulerBatchResultProcessor:
 
             # Finish handling can cut a speculative run short. Only retained
             # tokens contribute to reasoning usage and the think-end matcher.
-            retained_tokens = list(
-                req.output_ids[previous_output_len : req.finished_len]
-            )
-            if retained_tokens:
-                self._maybe_update_reasoning_tokens(req, retained_tokens)
+            if req.require_reasoning:
+                retained_tokens = list(
+                    req.output_ids[previous_output_len : req.finished_len]
+                )
+                if retained_tokens:
+                    self._maybe_update_reasoning_tokens(req, retained_tokens)
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
 
             if req.return_logprob:
